@@ -3,6 +3,13 @@
 " Date: 2013-05-03
 " Version: 1.0.0
 
+" TODO: what options? skip? per-leader nestability?
+let g:textobj_comment_ft_opt = {
+      \ 'coq': {'nestable': 1},
+      \ 'haskell': {'nestable': 1},
+      \ 'ocaml': {'nestable': 1},
+      \}
+
 " Select() {{{1
 
 " The Select() function contains the main algorithm for finding comments.
@@ -23,9 +30,14 @@ function! s:Select(inside, whitespace) abort
   if !empty(comment)
     return s:AdjustLineEnds(comment, a:whitespace, a:inside)
   endif
-  let comment = s:FindPairedLineComment(pos, paired_leaders, 0)
+
+  let [region_type, comment] = s:FindBlockComment(pos, paired_leaders, 0)
   if !empty(comment)
-    return s:AdjustLineEnds(comment, a:whitespace, a:inside)
+    if region_type ==# 'v'
+      return s:AdjustInlineEnds(comment, a:whitespace, a:inside)
+    else
+      return s:AdjustLineEnds(comment, a:whitespace, a:inside)
+    endif
   endif
 
   let comment = s:FindInlineComment(pos, simple_leaders, paired_leaders)
@@ -33,8 +45,11 @@ function! s:Select(inside, whitespace) abort
     return s:AdjustInlineEnds(comment, a:whitespace, a:inside)
   endif
 
+  " TODO: remove upwards?
+  return 0
+
   let scomment = s:FindSimpleLineComment(pos, simple_leaders, 1)
-  let pcomment = s:FindPairedLineComment(pos, paired_leaders, 1)
+  let pcomment = s:FindUnnestableBlockLineComment(pos, paired_leaders, 1)
   if !empty(scomment) || !empty(pcomment)
     if empty(scomment)
       let comment = pcomment
@@ -141,11 +156,87 @@ function! s:FindSimpleLineComment(pos, simple_leaders, upwards) abort
   return []
 endfunction
 
-" s:FindPairedLineComment() {{{2
-function! s:FindPairedLineComment(pos, paired_leaders, upwards) abort
+" s:FindBlockComment() {{{2
+" Returns ['V'|'v', comment]
+function! s:FindBlockComment(pos, paired_leaders, upwards) abort
+  if s:nestable()
+    if a:upwards
+      return []
+    else
+      return s:FindEnclosingNestableBlockComment(a:pos, a:paired_leaders)
+    endif
+  else
+    return ['V', s:FindUnnestableBlockLineComment(a:pos, a:paired_leaders, a:upwards)]
+  endif
+endfunction
+
+" s:FindEnclosingNestableBlockComment() {{{3
+function! s:FindEnclosingNestableBlockComment(pos, paired_leaders) abort
   let found = []
   for pair in a:paired_leaders
-    let pairpos = s:FindNearestPair(a:pos, pair, a:upwards)
+    let [region_type, pairpos] = s:FindEnclosingNestablePair(a:pos, pair)
+    if pairpos != []
+      let found = [pair, pairpos[0], pairpos[1]]
+      break
+    endif
+  endfor
+  return [region_type, found]
+endfunction
+
+" s:FindEnclosingNestablePair() {{{4
+function! s:FindEnclosingNestablePair(pos, pair) abort
+  let [open, close] = a:pair
+  let start = s:FindEnclosingNestablePairStart(open, close)
+  let end = s:FindEnclosingNestablePairEnd(open, close)
+
+  if start == [] || end == []
+    return ['', []]
+  endif
+
+  " There's something else in the comment lines → treat like inline comment
+  let endre = '\V\^\%(\%('.s:escape(close).'\)\@!\.\)\*\zs'.s:escape(close).'\s\*\$'
+  let startre = '\V\^\s\*\zs'.s:escape(open)
+  if match(getline(start[0]), startre) < 0 || match(getline(end[0]), endre) < 0
+    return ['v', [start, end]]
+  endif
+
+  " If it's a line comment, expand multiple one-line comments to one big comment
+  if start != [] && end != [] && start[0] == end[0]
+    call s:ExpandBlockLineComment(open, close, start, end)
+  endif
+
+  return ['V', [start, end]]
+endfunction
+
+function! s:FindEnclosingNestablePairStart(open, close) abort
+  let start = searchpairpos('\V\ze'.s:escape(a:open), '', '\V'.s:escape(a:close).'\zs', 'bcnW')
+  if start[0] > 0
+    return start
+  endif
+  return []
+endfunction
+
+function! s:FindEnclosingNestablePairEnd(open, close) abort
+  let end1 = searchpairpos('\V'.s:escape(a:open), '', '\V'.s:escape(a:close),  'nW')
+  let end2 = searchpairpos('\V\ze'.s:escape(a:open), '', '\V'.s:escape(a:close).'\zs',  'cnW')
+  let end2 = [end2[0], end2[1] - len(a:close)]
+  if end1[0] > 0
+    if end2[0] > 0
+      return (s:compare(end1, end2) < 0) ? end1 : end2
+    else
+      return end1
+    endif
+  elseif end2[0] > 0
+    return end2
+  endif
+  return []
+endfunction
+
+" s:FindUnnestableBlockLineComment() {{{3
+function! s:FindUnnestableBlockLineComment(pos, paired_leaders, upwards) abort
+  let found = []
+  for pair in a:paired_leaders
+    let pairpos = s:FindNearestUnnestablePair(a:pos, pair, a:upwards)
     if pairpos != []
       if !a:upwards
         let found = [pair, pairpos[0], pairpos[1]]
@@ -160,8 +251,8 @@ function! s:FindPairedLineComment(pos, paired_leaders, upwards) abort
   return found
 endfunction
 
-" s:FindNearestPair() {{{2
-function! s:FindNearestPair(pos, pair, upwards) abort
+" s:FindNearestUnnestablePair() {{{4
+function! s:FindNearestUnnestablePair(pos, pair, upwards) abort
   let [open, close] = a:pair
   let start = []
   let end   = []
@@ -236,32 +327,39 @@ function! s:FindNearestPair(pos, pair, upwards) abort
 
   " Expand multiple one-line comments to one big comment
   if start != [] && end != [] && start[0] == end[0]
-    let startre = '\V\^\s\*\zs'.s:escape(open).'\%(\%('.s:escape(close).'\)\@!\.\)\*'.s:escape(close).'\s\*\$'
-    let endre = '\V\^\s\*'.s:escape(open).'\%(\%('.s:escape(close).'\)\@!\.\)\*\zs'.s:escape(close).'\s\*\$'
-
-    let ln = start[0] - 1
-    while ln > 0
-      let col = match(getline(ln), startre)
-      if col < 0
-        break
-      endif
-      let [start[0], start[1]] = [ln, col+1]
-      let ln -= 1
-    endwhile
-
-    let ln = end[0] + 1
-    while ln <= line("$")
-      let col = match(getline(ln), endre)
-      if col < 0
-        break
-      endif
-      let [end[0], end[1]] = [ln, col+1]
-      let ln += 1
-    endwhile
+    call s:ExpandBlockLineComment(open, close, start, end)
   endif
 
   return start == [] || end == [] ? [] : [start, end]
 endfunction
+
+" s:ExpandBlockLineComment() {{{3
+" Modifies a:start, a:end to expand multiple one-line comments to one big comment.
+function! s:ExpandBlockLineComment(open, close, start, end)
+  let startre = '\V\^\s\*\zs'.s:escape(a:open).'\%(\%('.s:escape(a:close).'\)\@!\.\)\*'.s:escape(a:close).'\s\*\$'
+  let endre = '\V\^\s\*'.s:escape(a:open).'\%(\%('.s:escape(a:close).'\)\@!\.\)\*\zs'.s:escape(a:close).'\s\*\$'
+
+  let ln = a:start[0] - 1
+  while ln > 0
+    let col = match(getline(ln), startre)
+    if col < 0
+      break
+    endif
+    let [a:start[0], a:start[1]] = [ln, col+1]
+    let ln -= 1
+  endwhile
+
+  let ln = a:end[0] + 1
+  while ln <= line("$")
+    let col = match(getline(ln), endre)
+    if col < 0
+      break
+    endif
+    let [a:end[0], a:end[1]] = [ln, col+1]
+    let ln += 1
+  endwhile
+endfunction
+
 
 " s:FindInlineComment() {{{2
 function! s:FindInlineComment(pos, simple_leaders, paired_leaders) abort
@@ -289,6 +387,7 @@ function! s:FindInlineComment(pos, simple_leaders, paired_leaders) abort
   endif
 
   " Find a paired comment surrounding the cursor position
+  " TODO: breaks nesting as well
   for [open, close] in a:paired_leaders
     let sre = '\V'.s:escape(open)
     let ere = '\V'.s:escape(close)
@@ -526,6 +625,11 @@ function! s:compare(pos1, pos2) abort
     return 1
   endif
   return 0
+endfunction
+
+function! s:nestable() abort
+  let ft_opt = get(g:textobj_comment_ft_opt, &filetype, {})
+  return get(ft_opt, 'nestable', 0)
 endfunction
 
 " Public interface {{{1
